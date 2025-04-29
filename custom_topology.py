@@ -15,11 +15,11 @@ def custom_topology():
     s2 = net.addSwitch('s2', dpid='0000000000000002')  # Explicit DPID for s2
 
     print("*** Adding hosts")
-    h1 = net.addHost('h1', ip='10.0.0.1/24')
-    h2 = net.addHost('h2', ip='10.0.0.2/24')
-    attacker1 = net.addHost('attacker1', ip='10.0.0.3/24')
-    attacker2 = net.addHost('attacker2', ip='10.0.0.4/24')
-    ta1 = net.addHost('ta1')  # Traffic Agent host
+    h1 = net.addHost('h1', mac="00:00:00:00:00:01", ip='10.0.0.1/24')
+    h2 = net.addHost('h2', mac="00:00:00:00:00:02", ip='10.0.0.2/24')
+    attacker1 = net.addHost('attacker1', mac="00:00:00:00:00:03", ip='10.0.0.3/24')
+    attacker2 = net.addHost('attacker2', mac="00:00:00:00:00:04", ip='10.0.0.4/24')
+    ta1 = net.addHost('ta1', mac="00:00:00:00:00:05", ip='10.0.0.4/24')  # Traffic Agent host
 
     print("*** Creating links")
     net.addLink(h1, s1)

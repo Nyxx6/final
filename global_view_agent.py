@@ -1,298 +1,230 @@
 from ryu.base import app_manager
 from ryu.controller import ofp_event
-from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, set_ev_cls
+from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER, set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, arp, ethernet
+from ryu.lib import hub
+from ryu.topology import event
 import asyncio
 import threading
-import json, time
+import json, time, collections
 
 class GlobalViewAgent(app_manager.RyuApp):
     """
     GlobalViewAgent (Ryu SDN Controller) listens for flow reports from TrafficAgent,
-    decides to allow or drop flows, and installs OpenFlow rules accordingly.
-    It runs an asyncio TCP server (in a separate thread) for flow report messages.
+    decides to allow or drop flows, installs OpenFlow rules accordingly,
+    and also performs periodic DDoS monitoring using flow/port stats.
+    Additionally installs host-to-host paths on ARP learning to enable ping.
     """
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
+    # DDoS detection parameters
+    FLOW_LOW_THRESHOLD = 2     # pps lower than this are suspicious
+    FLOW_HIGH_THRESHOLD = 5    # pps higher are legitimate
+    PACKET_COUNT_THRESHOLD = 100  # packets per flow to flag
+    FLOW_COUNT_THRESHOLD = 20     # number of flagged flows to trigger mitigation
+    DETECTION_WINDOW = 10         # seconds for detection interval
+
     def __init__(self, *args, **kwargs):
         super(GlobalViewAgent, self).__init__(*args, **kwargs)
-        # Switch datapaths by DPID
+        # --- state ---
         self.datapaths = {}
-        # Switch agent ports (for TrafficAgent connection)
         self.agent_ports = {}
-        # Mapping of IP to switch port for each switch (learned via ARP)
         self.ip_to_port = {}
-        # Mapping ARP
         self.arp_table = {}
-        # Threshold parameters (shared across all switches/flows)
-        self.f_low = 2
-        self.f_high = 5
-        # TCP server settings for TrafficAgent communication
-        self.ta_host = '0.0.0.0'
-        self.ta_port = 9000
-        self.ta_writer = None
+        self.f_low = self.FLOW_LOW_THRESHOLD
+        self.f_high = self.FLOW_HIGH_THRESHOLD
+       
+        # --- TA comms ---
+        self.ta_host = '0.0.0.0'; self.ta_port = 9000; self.ta_writer = None
 
-        # Start the asyncio TCP server in a separate thread
+        # --- DDoS monitor ---
+        self.flow_stats = {}
+        self.port_stats = {}
+        self.suspicious_ips = collections.defaultdict(int)
+        self.last_detection = time.time()
+        self.monitor_thread = hub.spawn(self._monitor)
+
+        # --- start TCP server thread ---
         self.loop = asyncio.new_event_loop()
         self.server_thread = threading.Thread(target=self._start_tcp_server, daemon=True)
         self.server_thread.start()
-        self.logger.info("Started GlobalViewAgent TCP server thread")
+        self.logger.info("GlobalViewAgent started (TCP & monitor threads)")
 
-    def _start_tcp_server(self):
-        """Start asyncio TCP server to accept TrafficAgent connections."""
-        asyncio.set_event_loop(self.loop)
-        # Create TCP server coroutine
-        server_coro = asyncio.start_server(self._handle_ta_connection,
-                                           host=self.ta_host, port=self.ta_port)
-        server = self.loop.run_until_complete(server_coro)
-        self.logger.info(f"TCP server listening on {self.ta_host}:{self.ta_port}")
-        try:
-            self.loop.run_forever()
-        except Exception as e:
-            self.logger.error(f"Asyncio loop stopped: {e}")
-        server.close()
-        self.loop.run_until_complete(server.wait_closed())
-
-    async def _handle_ta_connection(self, reader, writer):
-        """Handle a new TrafficAgent connection."""
-        addr = writer.get_extra_info('peername')
-        self.logger.info(f"TrafficAgent connected from {addr}")
-        
-        # Save writer to send decisions back to TrafficAgent
-        self.ta_writer = writer
-
-        # Install IP→TA rules on all known switches
-        for dpid, datapath in self.datapaths.items():
-            agent_port = self.agent_ports.get(dpid)
-            if agent_port is None:
-                self.logger.warning(f"No TrafficAgent port for switch {dpid}")
-                continue
-
-            parser = datapath.ofproto_parser
-            ofproto = datapath.ofproto
-
-            match_ip = parser.OFPMatch(eth_type=0x0800)
-            actions = [parser.OFPActionOutput(agent_port)]
-            inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-
-            mod = parser.OFPFlowMod(
-                datapath=datapath,
-                priority=0,  # table-miss default for IP
-                match=match_ip,
-                instructions=inst
-            )
-            datapath.send_msg(mod)
-            self.logger.info(f"Installed IP→TA rule on switch {dpid} (port {agent_port})")
-
-        try:
-            while True:
-                # Read a length-prefixed JSON message
-                length_bytes = await reader.readexactly(4)
-                length = int.from_bytes(length_bytes, 'big')
-                data = await reader.readexactly(length)
-                msg = json.loads(data.decode())
-                self.logger.info(f"[GlobalViewAgent] Received: {msg}")
-                await self._handle_ta_message(msg)
-        except (asyncio.IncompleteReadError, ConnectionResetError) as e:
-            self.logger.warning(f"TrafficAgent connection lost: {e}")
-        finally:
-            # Clean up IP→TA rules on disconnect
-            for dpid, datapath in self.datapaths.items():
-                parser = datapath.ofproto_parser
-                ofproto = datapath.ofproto
-
-                match_ip = parser.OFPMatch(eth_type=0x0800)
-                mod = parser.OFPFlowMod(
-                    datapath=datapath,
-                    command=ofproto.OFPFC_DELETE,
-                    out_port=ofproto.OFPP_ANY,
-                    out_group=ofproto.OFPG_ANY,
-                    priority=0,
-                    match=match_ip
-                )
-                datapath.send_msg(mod)
-                self.logger.info(f"Removed IP→TA rule on switch {dpid}")
-
-            writer.close()
-            await writer.wait_closed()
-            self.logger.info(f"TrafficAgent connection from {addr} closed")
-            self.ta_writer = None
-
-
-    async def _handle_ta_message(self, msg):
-        """Handle messages received from the TrafficAgent."""
-        msg_type = msg.get("type")
-        if msg_type == "flow_report":
-            # Extract flow information
-            dpid = msg['dpid']
-            flow = tuple(msg["flow"])
-            count = msg["features"].get("packet_count", 0)
-            # Simple decision logic: allow flows above mid-threshold
-            if count > (self.f_low + self.f_high) / 2:
-                decision = "allow"
-            else:
-                decision = "drop"
-            # Install OpenFlow rule on switch             
-            self._install_flow_rule(dpid, flow, decision)
-            # Send the decision back to the TrafficAgent
-            response = {
-                "type": "decision",
-                "flow": list(flow),
-                "decision": decision
-            }
-            await self._send_to_ta(response)
-        else:
-            self.logger.info(f"[GlobalViewAgent] Unknown message type: {msg_type}")
-
-    async def _send_to_ta(self, message):
-        """Send a JSON message to the connected TrafficAgent."""
-        if self.ta_writer:
-            data = json.dumps(message).encode()
-            try:
-                self.ta_writer.write(len(data).to_bytes(4, 'big') + data)
-                await self.ta_writer.drain()
-                self.logger.info(f"[GlobalViewAgent] Sent: {message}")
-            except Exception as e:
-                self.logger.warning(f"Failed to send to TrafficAgent: {e}")
-        else:
-            self.logger.warning("No TrafficAgent connected; cannot send message")
-
-    def _install_flow_rule(self, dpid, flow, decision):
-        """Install an OpenFlow rule to drop or allow the given flow."""
-        datapath = self.datapaths.get(dpid)
-        if datapath is None:
-            self.logger.error(f"No datapath found for switch {dpid}")
-            return
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        ip_src, ip_dst, src_port, dst_port, proto = flow
-        # Determine IP protocol number
-        ip_proto = 6 if proto == 'TCP' else 17
-        # Build match for the flow
-        if proto == "TCP":
-            match = parser.OFPMatch(eth_type=0x0800,
-                                    ipv4_src=ip_src, ipv4_dst=ip_dst,
-                                    ip_proto=ip_proto,
-                                    tcp_src=src_port, tcp_dst=dst_port)
-        else:  # UDP
-            match = parser.OFPMatch(eth_type=0x0800,
-                                    ipv4_src=ip_src, ipv4_dst=ip_dst,
-                                    ip_proto=ip_proto,
-                                    udp_src=src_port, udp_dst=dst_port)
-        # Decide actions based on decision
-        if decision == "drop":
-            actions = []
-            self.logger.info(f"Installing DROP rule for flow {flow}")
-        else:  # allow
-            out_port = self._get_output_port(datapath, ip_dst)
-            if out_port:
-                actions = [parser.OFPActionOutput(out_port)]
-                self.logger.info(f"Installing ALLOW rule for flow {flow} to port {out_port}")
-            else:
-                # If destination unknown, flood as fallback
-                actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-                self.logger.info(f"Installing ALLOW rule for flow {flow} as FLOOD")
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        # Use higher priority than default table-miss
-        mod = parser.OFPFlowMod(datapath=datapath, priority=100,
-                                match=match, instructions=inst)
-        datapath.send_msg(mod)
-
-    def _get_output_port(self, datapath, dst_ip):
-        """Look up the output port for the given destination IP (learned via ARP)."""
-        ports = self.ip_to_port.get(datapath.id, {})
-        return ports.get(dst_ip)
-
+    # --------------------- Switch feature handler ---------------------
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Handle switch feature reply to install default flow rules."""
-        datapath = ev.msg.datapath
-        dpid = datapath.id
-        self.datapaths[dpid] = datapath
+        dp = ev.msg.datapath; dpid = dp.id
+        ofproto = dp.ofproto; parser = dp.ofproto_parser
+        # register
+        self.datapaths[dpid] = dp
+        self.agent_ports[dpid] = 3  # ensure matches Mininet topology
         self.ip_to_port.setdefault(dpid, {})
-        self.logger.info(f"Switch {dpid} connected.")
-        # specify agent port 
-        self.agent_ports[dpid] = 3 # forward table miss packets to port 3 for now as both swicthes are linked to TA by p3
 
-        self.logger.info(f"TrafficAgent port for switch {dpid} set to {self.agent_ports[dpid]}")
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        # Default: send ARP packets to controller for learning
-        match_arp = parser.OFPMatch(eth_type=0x0806)
-        actions_ctrl = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
-        self._add_flow(datapath, match_arp, actions_ctrl, priority=10)
+        # install ARP -> controller
+        m_arp = parser.OFPMatch(eth_type=0x0806)
+        inst_arp = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                       [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)])]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=10, match=m_arp, instructions=inst_arp))
 
+        # install IP -> TrafficAgent
+        port_ta = self.agent_ports[dpid]
+        m_ip = parser.OFPMatch(eth_type=0x0800)
+        inst_ip = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS,
+                       [parser.OFPActionOutput(port_ta)])]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=0, match=m_ip, instructions=inst_ip))
+
+        self.logger.info(f"Switch {dpid}: ARP->CTRL (prio10), IP->TA port {port_ta} (prio0)")
+
+    # ------------- PacketIn for ARP learning & path install -------------
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Handle PacketIn events to learn host locations and install paths."""
-        msg = ev.msg
-        datapath = msg.datapath
-        dpid = datapath.id
+        msg = ev.msg; dp = msg.datapath; dpid = dp.id
         in_port = msg.match['in_port']
         pkt = packet.Packet(msg.data)
-
         eth = pkt.get_protocol(ethernet.ethernet)
         arp_pkt = pkt.get_protocol(arp.arp)
 
+        # only handle ARP for learning
         if eth.ethertype == 0x0806 and arp_pkt:
-            src_ip = arp_pkt.src_ip
-            dst_ip = arp_pkt.dst_ip
-
-            # Learn source IP location (just like before)
+            src_ip = arp_pkt.src_ip; dst_ip = arp_pkt.dst_ip
+            # learn
             self.ip_to_port.setdefault(dpid, {})[src_ip] = in_port
-            self.arp_table[src_ip] = (dpid, in_port)  # for path install
-            self.logger.info(f"Learned {src_ip} is at switch {dpid} port {in_port}")
-
-            # If destination is known, install forward/reverse paths
-            if dst_ip in self.arp_table:
+            self.arp_table[src_ip] = (dpid, in_port)
+            self.logger.info(f"Learned host {src_ip}@{dpid}/{in_port}")
+            # if destination known, install bidirectional paths
+            if src_ip in self.arp_table and dst_ip in self.arp_table:
                 self._install_path(src_ip, dst_ip)
                 self._install_path(dst_ip, src_ip)
+                self.logger.info(f"Added paths {src_ip}={dst_ip} for {dpid}")
+            # flood ARP
+            parser = dp.ofproto_parser; ofp = dp.ofproto
+            out = parser.OFPPacketOut(datapath=dp, buffer_id=msg.buffer_id,
+                                      in_port=in_port,
+                                      actions=[parser.OFPActionOutput(ofp.OFPP_FLOOD)],
+                                      data=msg.data)
+            dp.send_msg(out)
 
-            # Flood ARP so other side learns
-            parser = datapath.ofproto_parser
-            ofproto = datapath.ofproto
-            actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
-            out = parser.OFPPacketOut(
-                datapath=datapath,
-                buffer_id=ofproto.OFP_NO_BUFFER,
-                in_port=in_port,
-                actions=actions,
-                data=msg.data
-            )
-            datapath.send_msg(out)
-    
     def _install_path(self, src_ip, dst_ip):
-        # Find the DPIDs and ports where each host lives
-        dpid_src, port_src = self.arp_table[src_ip]
-        dpid_dst, port_dst = self.arp_table[dst_ip]
+        # installs flow rules in both directions for IP traffic between two hosts
+        dpid, port = self.arp_table[src_ip]
+        dp = self.datapaths.get(dpid)
+        if not dp: return
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        # match IPv4 between src and dst
+        match = parser.OFPMatch(eth_type=0x0800,
+                                ipv4_src=src_ip, ipv4_dst=dst_ip)
+        # action: output to port of dst_ip
+        out_port = self.arp_table.get(dst_ip, (None,None))[1]
+        actions = [parser.OFPActionOutput(out_port)] if out_port else [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=50, match=match, instructions=inst))
+        self.logger.info(f"Installed path {src_ip}->{dst_ip} on switch {dpid} outport {out_port}")
 
-        # Install flow on source switch
-        match = parser.OFPMatch(
-            eth_type=0x0800,
-            ipv4_src=src_ip,
-            ipv4_dst=dst_ip,
-            ip_proto=1  # ICMP
+    # --------------------- BTCP server & TA comms ---------------------
+    def _start_tcp_server(self):
+        asyncio.set_event_loop(self.loop)
+        server = self.loop.run_until_complete(
+            asyncio.start_server(self._handle_ta_connection, self.ta_host, self.ta_port)
         )
-        actions = [parser.OFPActionOutput(port_dst)]
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(
-            datapath=self.datapaths[dpid_src],
-            priority=200,
-            match=match,
-            instructions=inst,
-            idle_timeout=30,
-            hard_timeout=60
-        )
-        self.datapaths[dpid_src].send_msg(mod)
+        self.logger.info(f"TCP server listening on {self.ta_host}:{self.ta_port}")
+        try:
+            self.loop.run_forever()
+        finally:
+            server.close(); self.loop.run_until_complete(server.wait_closed())
 
+    async def _handle_ta_connection(self, reader, writer):
+        addr = writer.get_extra_info('peername'); self.logger.info(f"TA connected from {addr}")
+        self.ta_writer = writer
+        # once connected, no need to reinstall default IP->TA (already done)
+        try:
+            while True:
+                length = int.from_bytes(await reader.readexactly(4), 'big')
+                data = await reader.readexactly(length)
+                msg = json.loads(data.decode()); self.logger.info(f"Recv TA: {msg}")
+                await self._handle_ta_message(msg)
+        except Exception as e:
+            self.logger.warning(f"TA disconnected: {e}")
+        finally:
+            writer.close(); await writer.wait_closed(); self.ta_writer = None
 
+    async def _handle_ta_message(self, msg):
+        if msg.get('type') != 'flow_report': return
+        dpid = msg['dpid']; flow = tuple(msg['flow']); cnt = msg['features'].get('packet_count', 0)
+        state = msg.get('state', 'p')
+        if state == 'p': # PENDING
+            # apply same thresholds
+            if cnt >= self.f_high:
+                decision = 'allow'
+            elif cnt <= self.f_low:
+                decision = 'drop'
+            else:
+                decision = 'drop'
+            self._install_flow_rule(dpid, flow, decision)
+            # reply
+            resp = {'type':'decision','flow':list(flow),'decision':decision}
+            if self.ta_writer:
+                data = json.dumps(resp).encode()
+                self.ta_writer.write(len(data).to_bytes(4,'big')+data)
+                await self.ta_writer.drain()
+        # FORWARD
+        elif state == 'd': self._install_flow_rule(dpid, flow, 'drop')
+        elif state == 'a': self._install_flow_rule(dpid, flow, 'allow')
+        else: self.logger.warning(f"unknown flow state")
 
-    def _add_flow(self, datapath, match, actions, priority=0):
-        """Helper to add a flow entry to the switch."""
-        parser = datapath.ofproto_parser
-        ofproto = datapath.ofproto
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
-                                match=match, instructions=inst)
-        datapath.send_msg(mod)
+    # --------------------- Flow rule installation ---------------------
+    def _install_flow_rule(self, dpid, flow, decision):
+        dp = self.datapaths.get(dpid)
+        if not dp: return
+        parser, ofp = dp.ofproto_parser, dp.ofproto
+        ip_src, ip_dst, src_p, dst_p, proto = flow
+        # match
+        if proto == 'TCP': match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src, ipv4_dst=ip_dst, ip_proto=6, tcp_src=src_p, tcp_dst=dst_p)
+        elif proto == 'UDP': match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src, ipv4_dst=ip_dst, ip_proto=17, udp_src=src_p, udp_dst=dst_p)
+        elif proto == 'ICMP' or proto == 1: match = parser.OFPMatch(eth_type=0x0800, ipv4_src=ip_src, ipv4_dst=ip_dst, ip_proto=1) # icmp
+        # actions
+        if decision == 'drop': actions = []
+        else:
+            out_port = self.ip_to_port.get(dpid,{}).get(ip_dst)
+            if out_port: actions = [parser.OFPActionOutput(out_port)]
+            else:        actions = [parser.OFPActionOutput(ofp.OFPP_FLOOD)]
+        inst = [parser.OFPInstructionActions(ofp.OFPIT_APPLY_ACTIONS, actions)]
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=100, match=match, instructions=inst))
+        self.logger.info(f"{decision.upper()} flow {flow} on switch {dpid} -> {actions}")
+
+    # --------------------- DDoS monitoring ---------------------
+    def _monitor(self):
+        while True:
+            for dp in list(self.datapaths.values()):
+                dp.send_msg(dp.ofproto_parser.OFPFlowStatsRequest(dp))
+                dp.send_msg(dp.ofproto_parser.OFPPortStatsRequest(dp, 0, dp.ofproto.OFPP_ANY))
+            if time.time() - self.last_detection > self.DETECTION_WINDOW:
+                for dpid, stats in self.flow_stats.items(): self._detect(dpid=dpid, stats=stats)
+                self.suspicious_ips.clear(); self.last_detection = time.time()
+            hub.sleep(5)
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def _flow_stats_reply(self, ev):
+        self.flow_stats[ev.msg.datapath.id] = ev.msg.body
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def _port_stats_reply(self, ev):
+        self.port_stats[ev.msg.datapath.id] = ev.msg.body
+
+    def _detect(self, dpid, stats):
+        cnts = collections.Counter()
+        for s in stats:
+            if 'ipv4_src' in s.match:
+                src_ip = s.match['ipv4_src']; cnts[src_ip] += 1
+                if s.packet_count > self.PACKET_COUNT_THRESHOLD:
+                    self.suspicious_ips[src_ip] += 1
+        for ip, c in cnts.items():
+            if self.suspicious_ips[ip] > self.FLOW_COUNT_THRESHOLD:
+                self.logger.warning(f"DDoS detected from {ip} on {dpid}")
+                self._mitigate(dpid, ip)
+
+    def _mitigate(self, dpid, src_ip):
+        dp = self.datapaths.get(dpid); parser=dp.ofproto_parser; ofp=dp.ofproto
+        match = parser.OFPMatch(eth_type=0x0800, ipv4_src=src_ip)
+        dp.send_msg(parser.OFPFlowMod(datapath=dp, priority=200, match=match, instructions=[]))
+        self.logger.info(f"Blocked traffic from {src_ip} on switch {dpid}")

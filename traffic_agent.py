@@ -4,7 +4,7 @@ import json
 import argparse
 from collections import defaultdict, deque
 from typing import Dict, Deque, Tuple, Any, List
-from scapy.all import AsyncSniffer, IP, TCP, UDP
+from scapy.all import AsyncSniffer, IP, TCP, UDP, ICMP
 
 FlowKey = Tuple[str, str, int, int, str]  # (src_ip, dst_ip, src_port, dst_port, protocol)
 
@@ -15,6 +15,7 @@ class TrafficAgent:
     and communicates flow reports to the GlobalViewAgent(controller)
     """
     def __init__(self, controller_host: str, controller_port: int, interfaces: List[str], dpids: List[str],  f_low: int = 2, f_high: int = 5, window_size: int = 5):
+        self.start_time = time.time()
         self.controller_host = controller_host
         self.controller_port = controller_port
         self.interfaces = interfaces
@@ -70,19 +71,27 @@ class TrafficAgent:
         await self.start()
 
     def _packet_handler(self, packet, iface: str):
-        """Called for each sniffed packet to update flow statistics."""
-        if IP in packet and (TCP in packet or UDP in packet):
+        """Called for each sniffed packet to update flow statistics."""        
+        if IP in packet:
             ip = packet[IP]
             if TCP in packet:
                 l4 = packet[TCP]
                 proto = "TCP"
-            else:
+                sport, dport = l4.sport, l4.dport
+            elif UDP in packet:
                 l4 = packet[UDP]
                 proto = "UDP"
-            flow = (ip.src, ip.dst, l4.sport, l4.dport, proto)
+                sport, dport = l4.sport, l4.dport
+            elif ICMP in packet:
+                proto = "ICMP"
+                sport, dport = 0, 0  # ICMP has no ports
+            else:
+                return  # Not TCP/UDP/ICMP
+
+            flow = (ip.src, ip.dst, sport, dport, proto)
             dpid = self.iface_dpid.get(iface)
             if dpid is None:
-                return # Unknown inerface, exit
+                return  # Unknown interface
             self.process_new_flow(flow, dpid)
 
     def process_new_flow(self, flow: FlowKey, dpid: int):
@@ -91,6 +100,7 @@ class TrafficAgent:
         then classify and possibly take action on the flow.
         """
         timestamp = time.time()
+        
         timestamps = self.flow_timestamps[flow]  # auto-inits deque via defaultdict
         timestamps.append(timestamp)
         # Remove timestamps older than the sliding window
@@ -107,23 +117,26 @@ class TrafficAgent:
         if count >= self.f_high:
             self.flow_action[flow] = "allow"
             self.enforce_decision(flow, "allow")
+            self.report_flow_to_controller(flow, count, dpid, 'a')
         elif count <= self.f_low:
             self.flow_action[flow] = "drop"
             self.enforce_decision(flow, "drop")
+            self.report_flow_to_controller(flow, count, dpid, 'd')
         else:
-            # Flow is in the intermediate range; report it to controller if first time
+            # Flow is in the intermediate range-> report to controller if first time
             if action is None:
                 self.flow_action[flow] = "pending"
-                self.report_flow_to_controller(flow, count, dpid)
+                self.report_flow_to_controller(flow, count, dpid, 'p')
 
     def enforce_decision(self, flow: FlowKey, decision: str):
         """
-        Enforce the decision locally (e.g., apply drop/allow).
-        Here we simply log the action.
+        Enforce the decision locally
+        simple log for now
+        Add fw rules / iptable
         """
         print(f"[TrafficAgent] {decision.upper()} flow {flow}")
 
-    def report_flow_to_controller(self, flow: FlowKey, count: int, dpid: int):
+    def report_flow_to_controller(self, flow: FlowKey, count: int, dpid: int, state: int):
         """
         Send a flow report (with packet count) to the GlobalViewAgent.
         """
@@ -133,7 +146,8 @@ class TrafficAgent:
             "type": "flow_report",
             "dpid" : dpid,
             "flow": flow,
-            "features": {"packet_count": count}
+            "features": {"packet_count": count},
+            "state": state
         }
         self._send_queue.put_nowait(message)
 
@@ -169,7 +183,7 @@ class TrafficAgent:
                 break
 
     async def _handle_controller_message(self, msg: Dict[str, Any]):
-        """Process commands from GlobalViewAgent (e.g., allow/drop decisions)."""
+        """Process policies from GlobalViewAgent (allow drop or update thresholds)"""
         msg_type = msg.get("type")
         if msg_type == "decision":
             flow = tuple(msg["flow"])
