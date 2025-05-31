@@ -5,8 +5,12 @@ from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet, ethernet, ether_types
 import logging
-from typing import Dict, Optional, Tuple, Any
-from dataclasses import dataclass
+from ryu.lib import hub
+import queue
+from typing import Dict, Optional, Any
+from dataclasses import dataclass, field
+from collections import defaultdict
+import time
 
 # Constants for flow and meter configuration
 DEFAULT_FLOW_IDLE_TIMEOUT = 60  # 1 minute
@@ -33,42 +37,7 @@ class FlowStats:
         self.last_update = time.time()
         self.is_active = True
 
-@dataclass
-class PortStats:
-    """Class to track port statistics and MAC learning."""
-    mac_count: int = 0
-    last_seen: float = field(default_factory=time.time)
-    rx_packets: int = 0
-    tx_packets: int = 0
-    rx_bytes: int = 0
-    tx_bytes: int = 0
-    rx_dropped: int = 0
-    tx_dropped: int = 0
-    rx_errors: int = 0
-    tx_errors: int = 0
-    rx_frame_err: int = 0
-    rx_over_err: int = 0
-    rx_crc_err: int = 0
-    collisions: int = 0
-    duration_sec: int = 0
-    duration_nsec: int = 0
-    rx_rate: float = 0.0
-    tx_rate: float = 0.0
-    packet_in_rate: float = 0.0
-    last_rx_bytes: int = 0
-    last_tx_bytes: int = 0
-    last_rx_packets: int = 0
-    last_update: float = 0.0
-    flow_stats: Dict[tuple, FlowStats] = field(default_factory=dict)
-    history: Deque[Tuple[float, dict]] = field(default_factory=lambda: deque(maxlen=WINDOW_SIZE))
 
-    def update_rates(self, current_time: float) -> None:
-        """Update rate calculations."""
-        time_elapsed = current_time - self.last_update
-        if time_elapsed > 0:
-            self.rx_rate = (self.rx_bytes - self.last_rx_bytes) * 8 / time_elapsed  # bits per second
-            self.tx_rate = (self.tx_bytes - self.last_tx_bytes) * 8 / time_elapsed
-            self.packet_in_rate = (self.rx_packets - self.last_rx_packets) / time_elapsed
 
 # Ryu application class for SDN DDoS prevention
 class SimpleSwitch13(app_manager.RyuApp):
@@ -93,9 +62,8 @@ class SimpleSwitch13(app_manager.RyuApp):
         
         # Initialize data structures
         self.mac_to_port: Dict[int, Dict[str, int]] = {}
-        self.port_stats: Dict[Tuple[int, int], PortStats] = defaultdict(PortStats)
         self.flow_stats: Dict[int, Dict[tuple, FlowStats]] = defaultdict(dict)
-        self.datapaths: Dict[int, Any] = {} 
+        self.datapaths: Dict[int, Any] = {}
         
         # Configure logging
         self.logger = logging.getLogger('sdn_controller')
@@ -119,29 +87,20 @@ class SimpleSwitch13(app_manager.RyuApp):
         
         self.logger.info("Controller initialized with default rate %d bytes/sec", self.DEFAULT_RATE)
 
-        # Start monitoring thread for stats collection
+        # Start monitoring thread for flow stats collection
         self.monitor_thread = None
         self.is_active = True
         self.monitor_thread = self.spawn(self._monitor_loop)
 
     def _monitor_loop(self) -> None:
-        """Background thread to periodically request statistics."""
+        """Background thread to periodically request flow statistics."""
         while self.is_active:
             try:
                 for dp in list(self.datapaths.values()):
-                    self._request_port_stats(dp)
                     self._request_flow_stats(dp)
-                time.sleep(STATS_INTERVAL)
+                hub.sleep(STATS_INTERVAL)
             except Exception as e:
                 self.logger.error(f"Error in monitor loop: {e}")
-
-    def _request_port_stats(self, datapath) -> None:
-        """Send port statistics request to the switch."""
-        ofp = datapath.ofproto
-        ofp_parser = datapath.ofproto_parser
-        # Request stats for all ports
-        req = ofp_parser.OFPPortStatsRequest(datapath, 0, ofp.OFPP_ANY)
-        datapath.send_msg(req)
 
     def _request_flow_stats(self, datapath) -> None:
         """Send flow statistics request to the switch."""
@@ -159,48 +118,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         )
         datapath.send_msg(req)
 
-    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
-    def _port_stats_reply_handler(self, ev) -> None:
-        """Handle port statistics reply."""
-        body = ev.msg.body
-        dpid = ev.msg.datapath.id
-        current_time = time.time()
-        
-        for stat in body:
-            port_no = stat.port_no
-            port_key = (dpid, port_no)
-
-            # Initialize port stats if not exists
-            if port_key not in self.port_stats:
-                self.port_stats[port_key] = PortStats()
-            
-            # Update port statistics
-            port_stat = self.port_stats[port_key]
-            port_stat.rx_packets = stat.rx_packets
-            port_stat.tx_packets = stat.tx_packets
-            port_stat.rx_bytes = stat.rx_bytes
-            port_stat.tx_bytes = stat.tx_bytes
-            port_stat.rx_dropped = stat.rx_dropped
-            port_stat.tx_dropped = stat.tx_dropped
-            port_stat.rx_errors = stat.rx_errors
-            port_stat.tx_errors = stat.tx_errors
-            port_stat.rx_frame_err = stat.rx_frame_err
-            port_stat.rx_over_err = stat.rx_over_err
-            port_stat.rx_crc_err = stat.rx_crc_err
-            port_stat.collisions = stat.collisions
-            port_stat.duration_sec = stat.duration_sec
-            port_stat.duration_nsec = stat.duration_nsec
-            
-            # Update rates
-            port_stat.update_rates(current_time)
-            
-            # Store previous values for rate calculation
-            port_stat.last_rx_bytes = stat.rx_bytes
-            port_stat.last_tx_bytes = stat.tx_bytes
-            port_stat.last_rx_packets = stat.rx_packets
-            port_stat.last_update = current_time
-            
-            # Detect potential DDoS
+    # Port statistics have been removed, only flow statistics are kept
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev) -> None:
         """Handle flow statistics reply."""
@@ -401,11 +319,12 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     def _is_mac_flooding_attempt(self, dpid: int, port: int) -> bool:
         """Check if a port is attempting MAC flooding."""
-        port_stats = self.port_stats.get((dpid, port))
-        if port_stats and port_stats.mac_count > MAX_MAC_PER_PORT:
+        # Simple MAC count check without port statistics
+        mac_count = len([mac for mac, p in self.mac_to_port.get(dpid, {}).items() if p == port])
+        if mac_count > MAX_MAC_PER_PORT:
             self.logger.warning(
                 "Possible MAC flooding on switch %s port %d: %d MACs learned",
-                dpid, port, port_stats.mac_count
+                dpid, port, mac_count
             )
             return True
         return False
@@ -446,18 +365,8 @@ class SimpleSwitch13(app_manager.RyuApp):
             # Initialize MAC table for this switch
             self.mac_to_port.setdefault(dpid, {})
             
-            # Initialize port statistics
-            port_key = (dpid, in_port)
-            if port_key not in self.port_stats:
-                self.port_stats[port_key] = PortStats()
-            
-            port_stat = self.port_stats[port_key]
-            
             # Check for MAC flooding
             if src not in self.mac_to_port[dpid]:
-                port_stat.mac_count += 1
-                port_stat.last_seen = time.time()
-                
                 if self._is_mac_flooding_attempt(dpid, in_port):
                     self.logger.warning("Blocking potential MAC flooding from %s on port %d", src, in_port)
                     return
@@ -505,8 +414,7 @@ class SimpleSwitch13(app_manager.RyuApp):
     # Placeholder for future AI integration (Layer 3)
     def _ai_integration_placeholder(self):
         """Placeholder for integrating Adaptive Random Forest and RL for DDoS detection/mitigation."""
-        # TODO: Collect port stats (Packet Rate per Port) via OFPPortStatsRequest
-        # TODO: Collect flow stats (Flow-Pkts/s, Flow-Dur) via OFPFlowStatsRequest
+        # TODO: Collect flow stats (Flow-Pkts/s, Flow-Dur..) via OFPFlowStatsRequest
         # TODO: Feed stats into ARF model for attack classification
         # TODO: Call adjust_meter_rate with appropriate rate when attack detected
         # TODO: Call adjust_meter_rate with DEFAULT_RATE when attack mitigated
