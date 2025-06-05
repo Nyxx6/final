@@ -3,7 +3,7 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ethernet, ether_types
+from ryu.lib.packet import packet, ethernet, ether_types, arp, in_proto, ipv4, icmp, tcp, udp
 import logging
 from ryu.lib import hub
 from typing import Dict, Optional, Any
@@ -89,17 +89,17 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         # Start monitoring thread for flow stats collection
         self.is_active = True
-        self.monitor_thread = self.spawn(self._monitor_loop)
+        self.monitor_thread = hub.spawn(self._monitor_loop)
 
     def _monitor_loop(self) -> None:
         """Background thread to periodically request flow statistics."""
         while self.is_active:
-            for dp_id, dp in list(self.datapaths.items()): # Iterate over items to have dp_id for logging
+            for dp in list(self.datapaths.values()):
                 try:
-                    self.logger.debug(f"Requesting stats for datapath {dp_id}")
+                    self.logger.debug(f"Requesting stats for datapath {dp.id}")
                     self._request_flow_stats(dp)
                 except Exception as e:
-                    self.logger.error(f"Error requesting stats for datapath {dp_id}: {e}")
+                    self.logger.error(f"Error requesting stats for datapath {dp.id}: {e}")
             hub.sleep(STATS_INTERVAL)
 
     def _request_flow_stats(self, datapath) -> None:
@@ -390,13 +390,58 @@ class SimpleSwitch13(app_manager.RyuApp):
             with self.mac_to_port_lock:
                self.mac_to_port[dpid][src] = in_port
 
+            # --- Create granular match for installing flow rules ---
+            # Start with a default L2 match, and add more details if available
+            match_fields = {'in_port': in_port, 'eth_src': src, 'eth_dst': dst}
+
+            if eth.ethertype == ether_types.ETH_TYPE_IP:
+                match_fields['eth_type'] = eth.ethertype
+                ip_pkt = pkt.get_protocol(ipv4.ipv4)
+                if ip_pkt:
+                    match_fields['ipv4_src'] = ip_pkt.src
+                    match_fields['ipv4_dst'] = ip_pkt.dst
+                    match_fields['ip_proto'] = ip_pkt.proto
+
+                    if ip_pkt.proto == in_proto.IPPROTO_ICMP:
+                        icmp_pkt_proto = pkt.get_protocol(icmp.icmp)
+                        if icmp_pkt_proto:
+                            match_fields['icmpv4_type'] = icmp_pkt_proto.type
+                            match_fields['icmpv4_code'] = icmp_pkt_proto.code
+                    elif ip_pkt.proto == in_proto.IPPROTO_TCP:
+                        tcp_pkt_proto = pkt.get_protocol(tcp.tcp)
+                        if tcp_pkt_proto:
+                            match_fields['tcp_src'] = tcp_pkt_proto.src_port
+                            match_fields['tcp_dst'] = tcp_pkt_proto.dst_port
+                    elif ip_pkt.proto == in_proto.IPPROTO_UDP:
+                        udp_pkt_proto = pkt.get_protocol(udp.udp)
+                        if udp_pkt_proto:
+                            match_fields['udp_src'] = udp_pkt_proto.src_port
+                            match_fields['udp_dst'] = udp_pkt_proto.dst_port
+                else:
+                    self.logger.debug(f"DPID {dpid}: eth_type IP but no ipv4_protocol found in packet")
+            
+            elif eth.ethertype == ether_types.ETH_TYPE_ARP:
+                match_fields['eth_type'] = eth.ethertype
+                arp_pkt_proto = pkt.get_protocol(arp.arp)
+                if arp_pkt_proto:
+                    match_fields['arp_op'] = arp_pkt_proto.opcode
+                    match_fields['arp_spa'] = arp_pkt_proto.src_ip
+                    match_fields['arp_tpa'] = arp_pkt_proto.dst_ip
+                    match_fields['arp_sha'] = arp_pkt_proto.src_mac
+                    match_fields['arp_tha'] = arp_pkt_proto.dst_mac
+                else:
+                    self.logger.debug(f"DPID {dpid}: eth_type ARP but no arp_protocol found in packet")
+            # else: for other eth_types, match_fields remains L2 with in_port
+
+            match = parser.OFPMatch(**match_fields)
+            # --- End of granular match creation ---
+
             # Determine output port
             with self.mac_to_port_lock:
                out_port = self.mac_to_port[dpid].get(dst, ofproto.OFPP_FLOOD)
 
             # Install flow for known destinations in Table 1
             if out_port != ofproto.OFPP_FLOOD:
-                match = parser.OFPMatch(eth_dst=dst)
                 actions = [parser.OFPActionOutput(out_port)]
                 if self._add_flow(datapath, self.FORWARDING_TABLE_ID, 1, match, actions):
                     self.logger.debug(
