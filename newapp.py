@@ -3,7 +3,7 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.lib.packet import packet, ether, ethernet, ether_types, arp, in_proto, ipv4, icmp, tcp, udp
+from ryu.lib.packet import packet, ethernet, ether_types, arp, in_proto, ipv4, icmp, tcp, udp
 import logging
 from ryu.lib import hub
 from typing import Dict, Optional, Any, Tuple
@@ -534,15 +534,15 @@ class SimpleSwitch13(app_manager.RyuApp):
 
         with self.flow_stats_lock:
             for stat in body:
-                # 1) Skip zero‑packet or zero‑duration flows
-                if stat.packet_count == 0 or stat.duration_sec == 0:
+                # 1) Skip zero‑packet or zero‑duration flows (stat.packet_count == 0)
+                if stat.packet_count < 10 or stat.duration_sec == 0:
                     continue
 
                 # 2) Extract a strict 5‑tuple key or skip
                 flow_key = self._get_flow_key_from_stats(stat)
                 if flow_key is None:
                     continue  # ARP, broadcast, table-miss, non‑IP, etc.
-
+                    
                 self.logger.info(
                     f"[STATS_PROCESS] DPID={dpid} flow_key={flow_key} "
                     f"pkts={stat.packet_count} bytes={stat.byte_count} "
@@ -598,7 +598,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         m = stat.match
 
         # 1) Must be IPv4
-        if m.get('eth_type') != ether.ETH_TYPE_IP:
+        if m.get('eth_type') != ether_types.ETH_TYPE_IP:
             return None
 
         # 2) Need both IPv4 endpoints
