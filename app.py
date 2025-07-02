@@ -1,4 +1,3 @@
-import stat
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER, DEAD_DISPATCHER
@@ -12,7 +11,6 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 import time
 from threading import Lock
-import joblib
 
 from river.forest import ARFClassifier
 from river import metrics, stream, compose
@@ -190,7 +188,6 @@ class FlowFeatureTracker:
                 'Tot Fwd Pkts': float(flow_feat.tot_fwd_pkts),
                 'Tot Bwd Pkts': float(flow_feat.tot_bwd_pkts), 
                 'TotLen Fwd Pkts': float(flow_feat.totlen_fwd_pkts),
-                'TotLen Bwd Pkts': float(flow_feat.totlen_bwd_pkts),
                 'Flow Byts/s': float(flow_feat.flow_byts_per_sec),
                 'Flow Pkts/s': float(flow_feat.flow_pkts_per_sec),
                 'Protocol': float(flow_feat.protocol),
@@ -420,7 +417,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             self.logger.debug(f"DDoS probability: {ddos_prob:.3f}, Normal probability: {normal_prob:.3f}")
             
             # Detect DDoS if probability > threshold
-            if ddos_prob > 0.7:  # Lowered threshold for simulation
+            if ddos_prob > 0.6:  # Lowered threshold for simulation
                 self.logger.warning(f"DDoS attack detected! DDoS probability: {ddos_prob:.3f}")
                 # Online learning - update model with detected attack
                 self.ai_model.learn_one(clean_features, 0)  # 0 = DDoS
@@ -528,13 +525,10 @@ class SimpleSwitch13(app_manager.RyuApp):
         try:
             ofproto = datapath.ofproto
             parser = datapath.ofproto_parser
-            
-            burst_size = max(15000, int(rate * 0.01))
-            if rate == 0:
-                burst_size = 0
 
-            rate_kbps = int((rate * 8) / 1000)
-            burst_kbps = int((burst_size * 8) / 1000)
+            # Convert bytes/sec to kbps and ensure minimum values
+            rate_kbps = max(1, int((rate * 8) / 1000))
+            burst_kbps = max(15, int(rate_kbps * 0.1))  # 10% of rate
 
             bands = [parser.OFPMeterBandDrop(
                 type_=ofproto.OFPMBT_DROP, 
@@ -552,7 +546,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             
             datapath.send_msg(req)
             self.current_rate = rate
-            self.logger.info(f"Updated meter rate to {rate} bytes/sec on switch {datapath.id}")
+            self.logger.info(f"Updated meter rate to {rate_kbps} kbps on switch {datapath.id}")
             return True
             
         except Exception as e:
@@ -762,18 +756,3 @@ class SimpleSwitch13(app_manager.RyuApp):
         except Exception as e:
             self.logger.error(f"Failed to add flow: {e}")
             return False
-
-
-"""
-
-    def get_ai_features(self, dpid: int = None) -> dict:
-        # API method to get current AI features for external ML models
-        if dpid:
-            return {dpid: self.feature_tracker.extract_features_for_ai(dpid)}
-        else:
-            result = {}
-            with self.datapaths_lock:
-                for dp_id in self.datapaths.keys():
-                    result[dp_id] = self.feature_tracker.extract_features_for_ai(dp_id)
-            return result
-"""
