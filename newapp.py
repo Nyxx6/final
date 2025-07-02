@@ -224,7 +224,7 @@ class FlowFeatureTracker:
             else:
                 self.logger.warning(f"[FEATURE_INVALID] {conv_key}: {feature_vector}")
         
-        self.logger.info(f"[FEATURE_EXTRACT] DPID={dpid}: {len(features)} valid flows extracted")
+        #self.logger.info(f"[FEATURE_EXTRACT] DPID={dpid}: {len(features)} valid flows extracted")
         return features
     
     def cleanup_old_flows(self, max_age: int = 600) -> None:
@@ -343,7 +343,7 @@ class SimpleSwitch13(app_manager.RyuApp):
                     self.logger.debug(f"[AI_DETECTION] No features for switch {dpid}")
                     continue
                     
-                self.logger.info(f"[AI_DETECTION] Analyzing {len(features)} flows on switch {dpid}")
+                #self.logger.info(f"[AI_DETECTION] Analyzing {len(features)} flows on switch {dpid}")
                 
                 for feature_dict in features:
                     if self._detect_ddos(feature_dict):
@@ -352,7 +352,7 @@ class SimpleSwitch13(app_manager.RyuApp):
                         if self.mitigation_enabled:
                             self._mitigate_attack(dpid)
                         else:
-                            self.logger.info("[DDOS_ALERT] Mitigation disabled - no action taken")
+                            self.logger.debug("[DDOS_ALERT] Mitigation disabled - no action taken")
                         break
             except Exception as e:
                 self.logger.error(f"[AI_DETECTION_ERROR] Switch {dpid}: {e}")
@@ -427,7 +427,7 @@ class SimpleSwitch13(app_manager.RyuApp):
     def _detect_ddos(self, features: dict) -> bool:
         """AI-based DDoS detection - ENHANCED WITH DEBUGGING."""
         try:
-            self.logger.info(f"[DETECT_DDOS] Analyzing: {features}")
+            #self.logger.info(f"[DETECT_DDOS] Analyzing: {features}")
             
             # Remove non-feature keys
             feature_vector = {k: v for k, v in features.items() if k != 'conversation_key'}
@@ -450,18 +450,18 @@ class SimpleSwitch13(app_manager.RyuApp):
                 else:
                     clean_features[feature] = 0.0
             
-            self.logger.info(f"[DETECT_DDOS] Clean features: {clean_features}")
+            #self.logger.info(f"[DETECT_DDOS] Clean features: {clean_features}")
             
             # Get prediction probabilities
             try:
                 proba = self.ai_model.predict_proba_one(clean_features)
-                self.logger.info(f"[DETECT_DDOS] Model probabilities: {proba}")
+                #self.logger.info(f"[DETECT_DDOS] Model probabilities: {proba}")
             except Exception as e:
                 self.logger.error(f"[DETECT_DDOS] Model prediction failed: {e}")
                 return False
             
             if proba is None or len(proba) == 0:
-                self.logger.warning("[DETECT_DDOS] No probabilities returned")
+                #self.logger.warning("[DETECT_DDOS] No probabilities returned")
                 return False
             
             # Check probability of DDoS class
@@ -479,7 +479,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             else:
                 # Learn from normal traffic
                 self.ai_model.learn_one(clean_features, 1)
-                self.logger.info(f"[NORMAL_TRAFFIC] Normal traffic, probability: {normal_prob:.3f}")
+                #self.logger.info(f"[NORMAL_TRAFFIC] Normal traffic, probability: {normal_prob:.3f}")
                 return False
                 
         except Exception as e:
@@ -489,7 +489,7 @@ class SimpleSwitch13(app_manager.RyuApp):
     def _mitigate_attack(self, dpid: int) -> None:
         """Mitigate detected DDoS attack."""
         if not self.mitigation_enabled:
-            self.logger.info("Mitigation is disabled, DDoS detected but no action taken")
+            #self.logger.info("Mitigation is disabled, DDoS detected but no action taken")
             return
             
         with self.datapaths_lock:
@@ -530,7 +530,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         """Handle flow stats reply, skip non‑IP/TCP/UDP/ICMP entries automatically."""
         dpid = ev.msg.datapath.id
         body = ev.msg.body
-        self.logger.info(f"[STATS_REPLY] DPID={dpid}: Received {len(body)} flow stats")
+        #self.logger.info(f"[STATS_REPLY] DPID={dpid}: Received {len(body)} flow stats")
 
         with self.flow_stats_lock:
             for stat in body:
@@ -542,12 +542,12 @@ class SimpleSwitch13(app_manager.RyuApp):
                 flow_key = self._get_flow_key_from_stats(stat)
                 if flow_key is None:
                     continue  # ARP, broadcast, table-miss, non‑IP, etc.
-                    
-                self.logger.info(
-                    f"[STATS_PROCESS] DPID={dpid} flow_key={flow_key} "
-                    f"pkts={stat.packet_count} bytes={stat.byte_count} "
-                    f"duration={stat.duration_sec}"
-                )
+
+                #self.logger.info(
+                #    f"[STATS_PROCESS] DPID={dpid} flow_key={flow_key} "
+                #    f"pkts={stat.packet_count} bytes={stat.byte_count} "
+                #    f"duration={stat.duration_sec}"
+                #)
 
                 # 3) Update your controller's raw stats store
                 self.flow_stats.setdefault(dpid, {})
@@ -623,7 +623,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             dport = m.get('icmpv4_code', 0)
 
         key = (ip_src, ip_dst, proto, sport, dport)
-        self.logger.info(f"[FLOW_KEY] Valid: {key}")
+        #self.logger.info(f"[FLOW_KEY] Valid: {key}")
         return key
 
     def update_meter_rate(self, datapath: Any, rate: int) -> bool:
