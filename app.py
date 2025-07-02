@@ -176,56 +176,56 @@ class FlowFeatureTracker:
             flow_feature.update_backward(pkt_count, byte_count, duration)
     
     def extract_features_for_ai(self, dpid: int, min_duration: float = 0.1) -> list:
-    """Extract features in format ready for AI model."""
-    features = []
-    now = time.time()
-    
-    for conv_key, flow_feat in self.flow_features.get(dpid, {}).items():
-        # Calculate actual duration
-        actual_duration = max(flow_feat.duration_sec, now - flow_feat.start_time, 0.1)
+        """Extract features in format ready for AI model."""
+        features = []
+        now = time.time()
         
-        # Skip very old flows or flows with no traffic
-        if now - flow_feat.last_update > 300:
-            continue
+        for conv_key, flow_feat in self.flow_features.get(dpid, {}).items():
+            # Calculate actual duration
+            actual_duration = max(flow_feat.duration_sec, now - flow_feat.start_time, 0.1)
             
-        total_packets = flow_feat.tot_fwd_pkts + flow_feat.tot_bwd_pkts
-        total_bytes = flow_feat.totlen_fwd_pkts + flow_feat.totlen_bwd_pkts
+            # Skip very old flows or flows with no traffic
+            if now - flow_feat.last_update > 300:
+                continue
+                
+            total_packets = flow_feat.tot_fwd_pkts + flow_feat.tot_bwd_pkts
+            total_bytes = flow_feat.totlen_fwd_pkts + flow_feat.totlen_bwd_pkts
+            
+            # Must have some traffic to analyze
+            if total_packets == 0 and total_bytes == 0:
+                continue
+            
+            # Calculate rates safely
+            bytes_per_sec = max(0.0, total_bytes / max(0.1, actual_duration))
+            pkts_per_sec = max(0.0, total_packets / max(0.1, actual_duration))
+            
+            # Extract features with validation
+            feature_vector = {
+                'Tot Fwd Pkts': max(0.0, float(flow_feat.tot_fwd_pkts)),
+                'Tot Bwd Pkts': max(0.0, float(flow_feat.tot_bwd_pkts)), 
+                'TotLen Fwd Pkts': max(0.0, float(flow_feat.totlen_fwd_pkts)),
+                'Flow Byts/s': min(bytes_per_sec, 1e10),  # Cap at 10GB/s
+                'Flow Pkts/s': min(pkts_per_sec, 1e6),    # Cap at 1M pps
+                'Protocol': max(0.0, min(255.0, float(flow_feat.protocol))),
+                'Flow Duration': max(0.1, actual_duration),
+                'conversation_key': conv_key
+            }
+            
+            # Validate all features are reasonable
+            valid_feature = True
+            for key, value in feature_vector.items():
+                if key != 'conversation_key' and (not isinstance(value, (int, float)) or value < 0):
+                    valid_feature = False
+                    break
+            
+            if valid_feature:
+                features.append(feature_vector)
+                self.logger.info(f"[FEATURE_VALID] {conv_key}: pkts={total_packets}, bytes={total_bytes}, duration={actual_duration:.2f}")
+            else:
+                self.logger.warning(f"[FEATURE_INVALID] {conv_key}: {feature_vector}")
         
-        # Must have some traffic to analyze
-        if total_packets == 0 and total_bytes == 0:
-            continue
-        
-        # Calculate rates safely
-        bytes_per_sec = max(0.0, total_bytes / max(0.1, actual_duration))
-        pkts_per_sec = max(0.0, total_packets / max(0.1, actual_duration))
-        
-        # Extract features with validation
-        feature_vector = {
-            'Tot Fwd Pkts': max(0.0, float(flow_feat.tot_fwd_pkts)),
-            'Tot Bwd Pkts': max(0.0, float(flow_feat.tot_bwd_pkts)), 
-            'TotLen Fwd Pkts': max(0.0, float(flow_feat.totlen_fwd_pkts)),
-            'Flow Byts/s': min(bytes_per_sec, 1e10),  # Cap at 10GB/s
-            'Flow Pkts/s': min(pkts_per_sec, 1e6),    # Cap at 1M pps
-            'Protocol': max(0.0, min(255.0, float(flow_feat.protocol))),
-            'Flow Duration': max(0.1, actual_duration),
-            'conversation_key': conv_key
-        }
-        
-        # Validate all features are reasonable
-        valid_feature = True
-        for key, value in feature_vector.items():
-            if key != 'conversation_key' and (not isinstance(value, (int, float)) or value < 0):
-                valid_feature = False
-                break
-        
-        if valid_feature:
-            features.append(feature_vector)
-            self.logger.info(f"[FEATURE_VALID] {conv_key}: pkts={total_packets}, bytes={total_bytes}, duration={actual_duration:.2f}")
-        else:
-            self.logger.warning(f"[FEATURE_INVALID] {conv_key}: {feature_vector}")
-    
-    self.logger.info(f"[FEATURE_EXTRACT] DPID={dpid}: {len(features)} valid flows extracted")
-    return features
+        self.logger.info(f"[FEATURE_EXTRACT] DPID={dpid}: {len(features)} valid flows extracted")
+        return features
     
     def cleanup_old_flows(self, max_age: int = 600) -> None:
         """Remove flows older than max_age seconds."""
