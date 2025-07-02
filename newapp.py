@@ -526,105 +526,105 @@ class SimpleSwitch13(app_manager.RyuApp):
         datapath.send_msg(req)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-	def _flow_stats_reply_handler(self, ev) -> None:
-		"""Handle flow stats reply, skip non‑IP/TCP/UDP/ICMP entries automatically."""
-		dpid = ev.msg.datapath.id
-		body = ev.msg.body
-		self.logger.info(f"[STATS_REPLY] DPID={dpid}: Received {len(body)} flow stats")
+    def _flow_stats_reply_handler(self, ev) -> None:
+        """Handle flow stats reply, skip non‑IP/TCP/UDP/ICMP entries automatically."""
+        dpid = ev.msg.datapath.id
+        body = ev.msg.body
+        self.logger.info(f"[STATS_REPLY] DPID={dpid}: Received {len(body)} flow stats")
 
-		with self.flow_stats_lock:
-		    for stat in body:
-		        # 1) Skip zero‑packet or zero‑duration flows
-		        if stat.packet_count == 0 or stat.duration_sec == 0:
-		            continue
+        with self.flow_stats_lock:
+            for stat in body:
+                # 1) Skip zero‑packet or zero‑duration flows
+                if stat.packet_count == 0 or stat.duration_sec == 0:
+                    continue
 
-		        # 2) Extract a strict 5‑tuple key or skip
-		        flow_key = self._get_flow_key_from_stats(stat)
-		        if flow_key is None:
-		            continue  # ARP, broadcast, table-miss, non‑IP, etc.
+                # 2) Extract a strict 5‑tuple key or skip
+                flow_key = self._get_flow_key_from_stats(stat)
+                if flow_key is None:
+                    continue  # ARP, broadcast, table-miss, non‑IP, etc.
 
-		        self.logger.info(
-		            f"[STATS_PROCESS] DPID={dpid} flow_key={flow_key} "
-		            f"pkts={stat.packet_count} bytes={stat.byte_count} "
-		            f"duration={stat.duration_sec}"
-		        )
+                self.logger.info(
+                    f"[STATS_PROCESS] DPID={dpid} flow_key={flow_key} "
+                    f"pkts={stat.packet_count} bytes={stat.byte_count} "
+                    f"duration={stat.duration_sec}"
+                )
 
-		        # 3) Update your controller's raw stats store
-		        self.flow_stats.setdefault(dpid, {})
-		        if flow_key not in self.flow_stats[dpid]:
-		            self.flow_stats[dpid][flow_key] = FlowStats()
-		        flow_stat = self.flow_stats[dpid][flow_key]
-		        flow_stat.update(
-		            stat.packet_count,
-		            stat.byte_count,
-		            stat.duration_sec
-		        )
+                # 3) Update your controller's raw stats store
+                self.flow_stats.setdefault(dpid, {})
+                if flow_key not in self.flow_stats[dpid]:
+                    self.flow_stats[dpid][flow_key] = FlowStats()
+                flow_stat = self.flow_stats[dpid][flow_key]
+                flow_stat.update(
+                    stat.packet_count,
+                    stat.byte_count,
+                    stat.duration_sec
+                )
 
-		        # 4) Extract IPs for feature tracker (only called if flow_key was valid)
-		        src_ip, dst_ip = '', ''
-		        m = stat.match
-		        # Direct extraction of IPv4 fields
-		        if hasattr(m, 'ipv4_src'):
-		            src_ip = str(m.ipv4_src)
-		        if hasattr(m, 'ipv4_dst'):
-		            dst_ip = str(m.ipv4_dst)
-		        # Fallback via regex if necessary
-		        if not src_ip or not dst_ip:
-		            match_str = str(m)
-		            import re
-		            if not src_ip:
-		                sm = re.search(r'ipv4_src:(\d+\.\d+\.\d+\.\d+)', match_str)
-		                src_ip = sm.group(1) if sm else ''
-		            if not dst_ip:
-		                dm = re.search(r'ipv4_dst:(\d+\.\d+\.\d+\.\d+)', match_str)
-		                dst_ip = dm.group(1) if dm else ''
+                # 4) Extract IPs for feature tracker (only called if flow_key was valid)
+                src_ip, dst_ip = '', ''
+                m = stat.match
+                # Direct extraction of IPv4 fields
+                if hasattr(m, 'ipv4_src'):
+                    src_ip = str(m.ipv4_src)
+                if hasattr(m, 'ipv4_dst'):
+                    dst_ip = str(m.ipv4_dst)
+                # Fallback via regex if necessary
+                if not src_ip or not dst_ip:
+                    match_str = str(m)
+                    import re
+                    if not src_ip:
+                        sm = re.search(r'ipv4_src:(\d+\.\d+\.\d+\.\d+)', match_str)
+                        src_ip = sm.group(1) if sm else ''
+                    if not dst_ip:
+                        dm = re.search(r'ipv4_dst:(\d+\.\d+\.\d+\.\d+)', match_str)
+                        dst_ip = dm.group(1) if dm else ''
 
-		        # 5) Feed into your AI feature tracker
-		        self.feature_tracker.update_flow_stats(
-		            dpid,
-		            flow_key,
-		            stat.packet_count,
-		            stat.byte_count,
-		            max(0.1, float(stat.duration_sec)),
-		            src_ip,
-		            dst_ip
-		        )
+                # 5) Feed into your AI feature tracker
+                self.feature_tracker.update_flow_stats(
+                    dpid,
+                    flow_key,
+                    stat.packet_count,
+                    stat.byte_count,
+                    max(0.1, float(stat.duration_sec)),
+                    src_ip,
+                    dst_ip
+                )
 
     def _get_flow_key_from_stats(self, stat) -> Optional[Tuple[str,str,int,int,int]]:
-		"""
-		Extract a 5-tuple key (ip_src, ip_dst, proto, sport, dport).
-		Returns None for non-IPv4/TCP/UDP/ICMP flows so they get skipped.
-		"""
-		m = stat.match
+        """
+        Extract a 5-tuple key (ip_src, ip_dst, proto, sport, dport).
+        Returns None for non-IPv4/TCP/UDP/ICMP flows so they get skipped.
+        """
+        m = stat.match
 
-		# 1) Must be IPv4
-		if m.get('eth_type') != ether.ETH_TYPE_IP:
-		    return None
+        # 1) Must be IPv4
+        if m.get('eth_type') != ether.ETH_TYPE_IP:
+            return None
 
-		# 2) Need both IPv4 endpoints
-		ip_src = m.get('ipv4_src')
-		ip_dst = m.get('ipv4_dst')
-		if ip_src is None or ip_dst is None:
-		    return None
+        # 2) Need both IPv4 endpoints
+        ip_src = m.get('ipv4_src')
+        ip_dst = m.get('ipv4_dst')
+        if ip_src is None or ip_dst is None:
+            return None
 
-		# 3) Must be TCP, UDP, or ICMP
-		proto = m.get('ip_proto')
-		if proto not in (1, 6, 17):  # ICMP=1, TCP=6, UDP=17
-		    return None
+        # 3) Must be TCP, UDP, or ICMP
+        proto = m.get('ip_proto')
+        if proto not in (1, 6, 17):  # ICMP=1, TCP=6, UDP=17
+            return None
 
-		# 4) Extract transport ports or ICMP type/code
-		if proto in (6, 17):
-		    sport = m.get('tcp_src') or m.get('udp_src')
-		    dport = m.get('tcp_dst') or m.get('udp_dst')
-		    if sport is None or dport is None:
-		        return None
-		else:  # ICMP
-		    sport = m.get('icmpv4_type', 0)
-		    dport = m.get('icmpv4_code', 0)
+        # 4) Extract transport ports or ICMP type/code
+        if proto in (6, 17):
+            sport = m.get('tcp_src') or m.get('udp_src')
+            dport = m.get('tcp_dst') or m.get('udp_dst')
+            if sport is None or dport is None:
+                return None
+        else:  # ICMP
+            sport = m.get('icmpv4_type', 0)
+            dport = m.get('icmpv4_code', 0)
 
-		key = (ip_src, ip_dst, proto, sport, dport)
-		self.logger.info(f"[FLOW_KEY] Valid: {key}")
-		return key
+        key = (ip_src, ip_dst, proto, sport, dport)
+        self.logger.info(f"[FLOW_KEY] Valid: {key}")
+        return key
 
     def update_meter_rate(self, datapath: Any, rate: int) -> bool:
         """Dynamically adjust the meter rate."""
