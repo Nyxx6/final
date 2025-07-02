@@ -60,12 +60,8 @@ class FlowFeatures:
     
     # Protocol 
     protocol: int = 0
-
-    # Ports  (optional for now)
     src_port: int = 0
     dst_port: int = 0
-    
-    # IP addresses (optional for now)
     src_ip: str = ""
     dst_ip: str = ""
     
@@ -73,15 +69,25 @@ class FlowFeatures:
         """Update forward direction stats (A->B)."""
         self.fwd_packet_count = pkt_count
         self.fwd_byte_count = byte_count
-        self.duration_sec = duration
-        self.last_update = time.time()
+        # CRITICAL: Ensure duration is never 0
+        current_time = time.time()
+        if duration <= 0:
+            self.duration_sec = max(0.1, current_time - self.start_time)
+        else:
+            self.duration_sec = max(0.1, duration)
+        self.last_update = current_time
     
     def update_backward(self, pkt_count: int, byte_count: int, duration: float) -> None:
         """Update backward direction stats (B->A)."""
         self.bwd_packet_count = pkt_count
         self.bwd_byte_count = byte_count
-        self.duration_sec = max(self.duration_sec, duration)
-        self.last_update = time.time()
+        current_time = time.time()
+        if duration <= 0:
+            calculated_duration = max(0.1, current_time - self.start_time)
+            self.duration_sec = max(self.duration_sec, calculated_duration)
+        else:
+            self.duration_sec = max(self.duration_sec, max(0.1, duration))
+        self.last_update = current_time
     
     @property
     def tot_fwd_pkts(self) -> int:
@@ -104,22 +110,18 @@ class FlowFeatures:
         if self.duration_sec <= 0:
             return 0.0
         total_bytes = self.fwd_byte_count + self.bwd_byte_count
-        return total_bytes / self.duration_sec
+        return max(0.0, total_bytes / max(0.1, self.duration_sec))
     
     @property
     def flow_pkts_per_sec(self) -> float:
         if self.duration_sec <= 0:
             return 0.0
         total_packets = self.fwd_packet_count + self.bwd_packet_count
-        return total_packets / self.duration_sec
+        return max(0.0, total_packets / max(0.1, self.duration_sec))
     
     @property
     def flow_duration(self) -> float:
-        return self.duration_sec
-    
-    def get_protocol_name(self) -> str:
-        protocol_map = {1: 'ICMP', 6: 'TCP', 17: 'UDP'}
-        return protocol_map.get(self.protocol, f'PROTO_{self.protocol}')
+        return max(0.1, self.duration_sec)
 
 class FlowFeatureTracker:
     """Tracks bidirectional flow features for AI model."""
@@ -173,30 +175,57 @@ class FlowFeatureTracker:
         else:
             flow_feature.update_backward(pkt_count, byte_count, duration)
     
-    def extract_features_for_ai(self, dpid: int, min_duration: float = 1.0) -> list:
-        """Extract features in format ready for AI model."""
-        features = []
-        now = time.time()
+    def extract_features_for_ai(self, dpid: int, min_duration: float = 0.1) -> list:
+    """Extract features in format ready for AI model."""
+    features = []
+    now = time.time()
+    
+    for conv_key, flow_feat in self.flow_features.get(dpid, {}).items():
+        # Calculate actual duration
+        actual_duration = max(flow_feat.duration_sec, now - flow_feat.start_time, 0.1)
         
-        for conv_key, flow_feat in self.flow_features.get(dpid, {}).items():
-            # Only include flows with sufficient duration and skip very old flows (> 5min)
-            if flow_feat.duration_sec < min_duration or now - flow_feat.last_update > 300:
-                continue
+        # Skip very old flows or flows with no traffic
+        if now - flow_feat.last_update > 300:
+            continue
             
-            # Extract features matching the model's expected format
-            feature_vector = {
-                'Tot Fwd Pkts': float(flow_feat.tot_fwd_pkts),
-                'Tot Bwd Pkts': float(flow_feat.tot_bwd_pkts), 
-                'TotLen Fwd Pkts': float(flow_feat.totlen_fwd_pkts),
-                'Flow Byts/s': float(flow_feat.flow_byts_per_sec),
-                'Flow Pkts/s': float(flow_feat.flow_pkts_per_sec),
-                'Protocol': float(flow_feat.protocol),
-                'Flow Duration': float(flow_feat.flow_duration),
-                'conversation_key': conv_key  # Keep this for logging
-            }
-            features.append(feature_vector)
+        total_packets = flow_feat.tot_fwd_pkts + flow_feat.tot_bwd_pkts
+        total_bytes = flow_feat.totlen_fwd_pkts + flow_feat.totlen_bwd_pkts
         
-        return features
+        # Must have some traffic to analyze
+        if total_packets == 0 and total_bytes == 0:
+            continue
+        
+        # Calculate rates safely
+        bytes_per_sec = max(0.0, total_bytes / max(0.1, actual_duration))
+        pkts_per_sec = max(0.0, total_packets / max(0.1, actual_duration))
+        
+        # Extract features with validation
+        feature_vector = {
+            'Tot Fwd Pkts': max(0.0, float(flow_feat.tot_fwd_pkts)),
+            'Tot Bwd Pkts': max(0.0, float(flow_feat.tot_bwd_pkts)), 
+            'TotLen Fwd Pkts': max(0.0, float(flow_feat.totlen_fwd_pkts)),
+            'Flow Byts/s': min(bytes_per_sec, 1e10),  # Cap at 10GB/s
+            'Flow Pkts/s': min(pkts_per_sec, 1e6),    # Cap at 1M pps
+            'Protocol': max(0.0, min(255.0, float(flow_feat.protocol))),
+            'Flow Duration': max(0.1, actual_duration),
+            'conversation_key': conv_key
+        }
+        
+        # Validate all features are reasonable
+        valid_feature = True
+        for key, value in feature_vector.items():
+            if key != 'conversation_key' and (not isinstance(value, (int, float)) or value < 0):
+                valid_feature = False
+                break
+        
+        if valid_feature:
+            features.append(feature_vector)
+            self.logger.info(f"[FEATURE_VALID] {conv_key}: pkts={total_packets}, bytes={total_bytes}, duration={actual_duration:.2f}")
+        else:
+            self.logger.warning(f"[FEATURE_INVALID] {conv_key}: {feature_vector}")
+    
+    self.logger.info(f"[FEATURE_EXTRACT] DPID={dpid}: {len(features)} valid flows extracted")
+    return features
     
     def cleanup_old_flows(self, max_age: int = 600) -> None:
         """Remove flows older than max_age seconds."""
@@ -298,24 +327,35 @@ class SimpleSwitch13(app_manager.RyuApp):
             hub.sleep(STATS_INTERVAL * 2)  # Run less frequently (10s)
 
     def _run_ai_detection(self) -> None:
-        """Run DDoS detection on all switches."""
+        """Run DDoS detection on all switches - ENHANCED DEBUGGING."""
         with self.datapaths_lock:
             dpids = list(self.datapaths.keys())
         
+        if not dpids:
+            self.logger.debug("[AI_DETECTION] No switches connected")
+            return
+        
         for dpid in dpids:
-            features = self.feature_tracker.extract_features_for_ai(dpid)
-            
-            if not features:  # No flows to analyze
-                continue
+            try:
+                features = self.feature_tracker.extract_features_for_ai(dpid)
                 
-            self.logger.debug(f"Analyzing {len(features)} flows on switch {dpid}")
-            
-            for feature_dict in features:
-                if self._detect_ddos(feature_dict):
-                    conv_key = feature_dict.get('conversation_key', 'unknown')
-                    self.logger.warning(f"DDoS detected on switch {dpid}: {conv_key}")
-                    self._mitigate_attack(dpid)
-                    break  # Only mitigate once per detection cycle
+                if not features:
+                    self.logger.debug(f"[AI_DETECTION] No features for switch {dpid}")
+                    continue
+                    
+                self.logger.info(f"[AI_DETECTION] Analyzing {len(features)} flows on switch {dpid}")
+                
+                for feature_dict in features:
+                    if self._detect_ddos(feature_dict):
+                        conv_key = feature_dict.get('conversation_key', 'unknown')
+                        self.logger.critical(f"[DDOS_ALERT] Attack detected on switch {dpid}: {conv_key}")
+                        if self.mitigation_enabled:
+                            self._mitigate_attack(dpid)
+                        else:
+                            self.logger.info("[DDOS_ALERT] Mitigation disabled - no action taken")
+                        break
+            except Exception as e:
+                self.logger.error(f"[AI_DETECTION_ERROR] Switch {dpid}: {e}")
 
     def get_pipeline(self) -> Any:
         # Initialize online pipeline with ARFClassifier
@@ -390,46 +430,65 @@ class SimpleSwitch13(app_manager.RyuApp):
             # self.logger.info("Using fallback model initialization")
 
     def _detect_ddos(self, features: dict) -> bool:
-        """AI-based DDoS detection using Adaptive Random Forest."""
+        """AI-based DDoS detection - ENHANCED WITH DEBUGGING."""
         try:
+            self.logger.info(f"[DETECT_DDOS] Analyzing: {features}")
+            
             # Remove non-feature keys
             feature_vector = {k: v for k, v in features.items() if k != 'conversation_key'}
             
-            # Ensure all features are present and convert to float
+            # Validate and clean features
             clean_features = {}
             for feature in self.model_features:
                 if feature in feature_vector:
-                    clean_features[feature] = float(feature_vector[feature])
+                    value = float(feature_vector[feature])
+                    # Sanity check values
+                    if feature == 'Protocol':
+                        value = max(0.0, min(255.0, value))
+                    elif feature.endswith('/s'):
+                        value = max(0.0, min(1e10, value))  # Cap rates
+                    elif feature == 'Flow Duration':
+                        value = max(0.1, value)
+                    else:
+                        value = max(0.0, value)
+                    clean_features[feature] = value
                 else:
-                    clean_features[feature] = 0.0  # Default value for missing features
+                    clean_features[feature] = 0.0
+            
+            self.logger.info(f"[DETECT_DDOS] Clean features: {clean_features}")
             
             # Get prediction probabilities
-            proba = self.ai_model.predict_proba_one(clean_features)
-            
-            # Check if probabilities are returned
-            if proba is None or len(proba) == 0:
+            try:
+                proba = self.ai_model.predict_proba_one(clean_features)
+                self.logger.info(f"[DETECT_DDOS] Model probabilities: {proba}")
+            except Exception as e:
+                self.logger.error(f"[DETECT_DDOS] Model prediction failed: {e}")
                 return False
             
-            # Check probability of DDoS class (assuming 0 = DDoS, 1 = Normal)
-            ddos_prob = proba.get(0, 0.0)
-            normal_prob = proba.get(1, 0.0)
+            if proba is None or len(proba) == 0:
+                self.logger.warning("[DETECT_DDOS] No probabilities returned")
+                return False
             
-            self.logger.debug(f"DDoS probability: {ddos_prob:.3f}, Normal probability: {normal_prob:.3f}")
+            # Check probability of DDoS class
+            ddos_prob = proba.get(0, 0.0)  # Assuming 0 = DDoS
+            normal_prob = proba.get(1, 0.0)  # Assuming 1 = Normal
             
-            # Detect DDoS if probability > threshold
-            if ddos_prob > 0.7:  # Lowered threshold for simulation
-                self.logger.warning(f"DDoS attack detected! DDoS probability: {ddos_prob:.3f}")
-                # Online learning - update model with detected attack
-                self.ai_model.learn_one(clean_features, 0)  # 0 = DDoS
+            self.logger.info(f"[DETECT_DDOS] DDoS: {ddos_prob:.3f}, Normal: {normal_prob:.3f}")
+            
+            # Detect DDoS with lower threshold for testing
+            if ddos_prob > 0.5:  # Lower threshold for testing
+                self.logger.warning(f"[DDOS_DETECTED] Attack detected! Probability: {ddos_prob:.3f}")
+                # Learn from detected attack
+                self.ai_model.learn_one(clean_features, 0)
                 return True
             else:
                 # Learn from normal traffic
-                self.ai_model.learn_one(clean_features, 1)  # 1 = Normal
-                self.logger.warning(f"-----------------------Probability: {normal_prob:.3f}")
+                self.ai_model.learn_one(clean_features, 1)
+                self.logger.info(f"[NORMAL_TRAFFIC] Normal traffic, probability: {normal_prob:.3f}")
                 return False
                 
         except Exception as e:
-            self.logger.error(f"Error during DDoS detection: {e}")
+            self.logger.error(f"[DETECT_DDOS_ERROR] {e}", exc_info=True)
             return False
     
     def _mitigate_attack(self, dpid: int) -> None:
@@ -474,52 +533,142 @@ class SimpleSwitch13(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
     def _flow_stats_reply_handler(self, ev) -> None:
-        """Handle flow statistics reply from switch."""
+        """Handle flow statistics reply from switch - CRITICAL FIX."""
         body = ev.msg.body
         dpid = ev.msg.datapath.id
         
+        self.logger.debug(f"[STATS_REPLY] DPID={dpid}: Received {len(body)} flow stats")
+        
         with self.flow_stats_lock:
             for stat in body:
+                # Skip table-miss flows and very short-lived flows
+                if stat.packet_count == 0 or stat.duration_sec == 0:
+                    continue
+                    
                 flow_key = self._get_flow_key_from_stats(stat)
                 if not flow_key:
                     continue
-                    
+                
+                self.logger.info(f"[STATS_PROCESS] DPID={dpid} flow_key={flow_key} pkts={stat.packet_count} bytes={stat.byte_count} duration={stat.duration_sec}")
+                
                 # Update original flow statistics
                 if dpid not in self.flow_stats:
                     self.flow_stats[dpid] = {}
-                    
                 if flow_key not in self.flow_stats[dpid]:
                     self.flow_stats[dpid][flow_key] = FlowStats()
-                    
+                
                 flow_stat = self.flow_stats[dpid][flow_key]
                 flow_stat.update(stat.packet_count, stat.byte_count, stat.duration_sec)
                 
-                # Update AI feature tracker
-                # Extract IP addresses if available
-                src_ip = stat.match.get('ipv4_src', '')
-                dst_ip = stat.match.get('ipv4_dst', '')
+                # Extract IP addresses with multiple fallback methods
+                src_ip = ''
+                dst_ip = ''
+                
+                try:
+                    # Method 1: Direct attribute access
+                    if hasattr(stat.match, 'ipv4_src'):
+                        src_ip = str(stat.match.ipv4_src)
+                    if hasattr(stat.match, 'ipv4_dst'):
+                        dst_ip = str(stat.match.ipv4_dst)
+                    
+                    # Method 2: String parsing fallback
+                    if not src_ip or not dst_ip:
+                        match_str = str(stat.match)
+                        import re
+                        if not src_ip:
+                            src_match = re.search(r'ipv4_src:(\d+\.\d+\.\d+\.\d+)', match_str)
+                            if src_match:
+                                src_ip = src_match.group(1)
+                        if not dst_ip:
+                            dst_match = re.search(r'ipv4_dst:(\d+\.\d+\.\d+\.\d+)', match_str)
+                            if dst_match:
+                                dst_ip = dst_match.group(1)
+                except Exception as e:
+                    self.logger.debug(f"[IP_EXTRACT_ERROR] {e}")
+                
+                # Update AI feature tracker with validated data
                 self.feature_tracker.update_flow_stats(
                     dpid, flow_key,
-                    stat.packet_count,
-                    stat.byte_count,
-                    float(stat.duration_sec),
+                    max(0, stat.packet_count),
+                    max(0, stat.byte_count),
+                    max(0.1, float(stat.duration_sec)),
                     src_ip, dst_ip
                 )
 
     def _get_flow_key_from_stats(self, stat) -> Optional[tuple]:
-        """Extract flow key from flow stats."""
+        """Extract flow key from flow stats - CRITICAL FIX."""
         try:
-            eth_src = stat.match.get('eth_src', '00:00:00:00:00:00')
-            eth_dst = stat.match.get('eth_dst', '00:00:00:00:00:00')
-            ip_proto = stat.match.get('ip_proto', 0)
-            src_port = stat.match.get('tcp_src') or stat.match.get('udp_src') or 0
-            dst_port = stat.match.get('tcp_dst') or stat.match.get('udp_dst') or 0
+            # Default values
+            eth_src = '00:00:00:00:00:00'
+            eth_dst = 'ff:ff:ff:ff:ff:ff'
+            ip_proto = 0
+            src_port = 0
+            dst_port = 0
             
-            return (eth_src, eth_dst, ip_proto, src_port, dst_port)
+            # Extract from match using proper OpenFlow method
+            match = stat.match
+            if hasattr(match, 'fields'):
+                for field in match.fields:
+                    if hasattr(field, 'header') and hasattr(field, 'value'):
+                        if field.header == 'eth_src':
+                            eth_src = field.value
+                        elif field.header == 'eth_dst':
+                            eth_dst = field.value
+                        elif field.header == 'ip_proto':
+                            ip_proto = field.value
+                        elif field.header == 'tcp_src':
+                            src_port = field.value
+                        elif field.header == 'tcp_dst':
+                            dst_port = field.value
+                        elif field.header == 'udp_src':
+                            src_port = field.value
+                        elif field.header == 'udp_dst':
+                            dst_port = field.value
+            
+            # Alternative method using string representation
+            if eth_src == '00:00:00:00:00:00' and eth_dst == 'ff:ff:ff:ff:ff:ff':
+                match_str = str(match)
+                import re
+                
+                # Extract MAC addresses
+                eth_src_match = re.search(r'eth_src:([a-f0-9:]{17})', match_str)
+                if eth_src_match:
+                    eth_src = eth_src_match.group(1)
+                    
+                eth_dst_match = re.search(r'eth_dst:([a-f0-9:]{17})', match_str)
+                if eth_dst_match:
+                    eth_dst = eth_dst_match.group(1)
+                
+                # Extract protocol
+                proto_match = re.search(r'ip_proto:(\d+)', match_str)
+                if proto_match:
+                    ip_proto = int(proto_match.group(1))
+                
+                # Extract ports
+                tcp_src_match = re.search(r'tcp_src:(\d+)', match_str)
+                if tcp_src_match:
+                    src_port = int(tcp_src_match.group(1))
+                    
+                tcp_dst_match = re.search(r'tcp_dst:(\d+)', match_str)
+                if tcp_dst_match:
+                    dst_port = int(tcp_dst_match.group(1))
+                    
+                udp_src_match = re.search(r'udp_src:(\d+)', match_str)
+                if udp_src_match:
+                    src_port = int(udp_src_match.group(1))
+                    
+                udp_dst_match = re.search(r'udp_dst:(\d+)', match_str)
+                if udp_dst_match:
+                    dst_port = int(udp_dst_match.group(1))
+            
+            flow_key = (eth_src, eth_dst, ip_proto, src_port, dst_port)
+            self.logger.debug(f"[FLOW_KEY] Extracted: {flow_key} from match: {match}")
+            return flow_key
+            
         except Exception as e:
-            self.logger.error(f"Error extracting flow key: {e}")
-            return None
-
+            self.logger.error(f"[FLOW_KEY_ERROR] Failed to extract flow key: {e}")
+            # Return a basic flow key to keep the system running
+            return ('00:00:00:00:00:00', 'ff:ff:ff:ff:ff:ff', 0, 0, 0)
 
     def update_meter_rate(self, datapath: Any, rate: int) -> bool:
         """Dynamically adjust the meter rate."""
@@ -562,40 +711,65 @@ class SimpleSwitch13(app_manager.RyuApp):
     
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Handle switch connection and initialize flow tables."""
+        """Handle switch connection - FIXED METER CONFIGURATION."""
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-
+    
         with self.datapaths_lock:
             self.datapaths[datapath.id] = datapath
-
-        # Configure meter
-        burst_size = max(15000, int(self.DEFAULT_RATE * 0.01))
-        if self.DEFAULT_RATE == 0:
-            burst_size = 0
-        bands = [parser.OFPMeterBandDrop(type_=ofproto.OFPMBT_DROP, 
-                                        rate=self.DEFAULT_RATE, burst_size=burst_size)]
-        req = parser.OFPMeterMod(datapath, command=ofproto.OFPMC_ADD, 
-                                meter_id=self.METER_ID, bands=bands)
+    
+        self.logger.info(f"[SWITCH_CONNECT] Switch {datapath.id} connected")
+    
+        # Configure meter with proper units (kbps)
+        rate_kbps = max(1, int((self.DEFAULT_RATE * 8) / 1000))  # Convert bytes/sec to kbps
+        burst_size = max(15, int(rate_kbps * 0.1))  # 10% of rate
+        
+        bands = [parser.OFPMeterBandDrop(
+            type_=ofproto.OFPMBT_DROP, 
+            rate=rate_kbps, 
+            burst_size=burst_size
+        )]
+        
+        req = parser.OFPMeterMod(
+            datapath=datapath,
+            command=ofproto.OFPMC_ADD,
+            flags=ofproto.OFPMF_KBPS,  # CRITICAL: Specify kbps flag
+            meter_id=self.METER_ID,
+            bands=bands
+        )
         datapath.send_msg(req)
-
-        # Install flows
+        self.logger.info(f"[METER_CONFIG] Configured meter: {rate_kbps} kbps, burst: {burst_size}")
+    
+        # Install table-miss flow for meter table (Table 0)
         match = parser.OFPMatch()
         instructions = [
             parser.OFPInstructionMeter(self.METER_ID),
             parser.OFPInstructionGotoTable(self.FORWARDING_TABLE_ID)
         ]
-        mod = parser.OFPFlowMod(datapath, table_id=self.METER_TABLE_ID, 
-                               priority=0, match=match, instructions=instructions)
+        mod = parser.OFPFlowMod(
+            datapath=datapath, 
+            table_id=self.METER_TABLE_ID,
+            priority=0, 
+            match=match, 
+            instructions=instructions
+        )
         datapath.send_msg(mod)
-
+        self.logger.info("[TABLE_CONFIG] Installed meter table flow")
+    
+        # Install table-miss flow for forwarding table (Table 1)
         match = parser.OFPMatch()
         actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        mod = parser.OFPFlowMod(datapath, table_id=self.FORWARDING_TABLE_ID, 
-                               priority=0, match=match, instructions=inst)
+        mod = parser.OFPFlowMod(
+            datapath=datapath, 
+            table_id=self.FORWARDING_TABLE_ID,
+            priority=0, 
+            match=match, 
+            instructions=inst
+        )
         datapath.send_msg(mod)
+        self.logger.info("[TABLE_CONFIG] Installed forwarding table flow")
 
     @set_ev_cls(ofp_event.EventOFPStateChange, [MAIN_DISPATCHER, DEAD_DISPATCHER])
     def _state_change_handler(self, ev):
