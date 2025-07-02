@@ -17,7 +17,7 @@ from river import metrics, stream, compose
 from river.drift import ADWIN
 from river.preprocessing import StandardScaler
 import pandas as pd
-
+import stat
 
 # Global constants
 DEFAULT_FLOW_IDLE_TIMEOUT = 60
@@ -215,6 +215,16 @@ class SimpleSwitch13(app_manager.RyuApp):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super(SimpleSwitch13, self).__init__(*args, **kwargs)
         
+        # Logging setup
+        self.logger = logging.getLogger('sdn_controller')
+        self.logger.setLevel(logging.INFO)
+        
+        if not self.logger.handlers:
+            ch = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            ch.setFormatter(formatter)
+            self.logger.addHandler(ch)
+        
         # Original data structures
         self.mac_to_port: Dict[int, Dict[str, int]] = {} # [dpid][mac] = port
         self.mac_to_port_lock = Lock()
@@ -237,16 +247,6 @@ class SimpleSwitch13(app_manager.RyuApp):
         # Toggle mitigation
         self.mitigation_enabled = False
         
-        # Logging setup
-        self.logger = logging.getLogger('sdn_controller')
-        self.logger.setLevel(logging.INFO)
-        
-        if not self.logger.handlers:
-            ch = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            ch.setFormatter(formatter)
-            self.logger.addHandler(ch)
-        
         # OpenFlow pipeline configuration
         self.METER_TABLE_ID = 0
         self.FORWARDING_TABLE_ID = 1
@@ -257,7 +257,7 @@ class SimpleSwitch13(app_manager.RyuApp):
         # Mitigation rate
         self.MITIGATION_RATE = 100000000  # 100Mbps
         
-        self.logger.info(f"Controller initialized with default rate {self.DEFAULT_RATE} bytes/sec")
+        self.logger.info(f"*****Controller initialized with default rate {self.DEFAULT_RATE} bytes/sec*****")
 
         # Start monitoring threads
         self.is_active = True
@@ -329,7 +329,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             disable_weighted_vote=False,
             split_criterion="gini",
             leaf_prediction="nb",
-            max_depth=10,  
+            max_depth=15,  
             seed=42
         )
     )
@@ -338,11 +338,11 @@ class SimpleSwitch13(app_manager.RyuApp):
         """Warm up the AI model with a small dataset."""
         try:
             # Load training data
-            warmup_data = pd.read_csv('Training data/resampled_dataset1.csv')
+            warmup_data = pd.read_csv('training_data/resampled_dataset1.csv')
             
             # Select only the features that match our model
             feature_columns = [
-                'Tot Fwd Pkts', 'Tot Bwd Pkts', 'TotLen Fwd Pkts', 'TotLen Bwd Pkts',
+                'Tot Fwd Pkts', 'Tot Bwd Pkts', 'TotLen Fwd Pkts',
                 'Flow Byts/s', 'Flow Pkts/s', 'Protocol', 'Flow Duration'
             ]
             
@@ -356,7 +356,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             y = warmup_data['Label']
             
             # Take a smaller sample for warmup (first 1000 rows)
-            sample_size = min(1000, len(X))
+            sample_size = min(2000, len(X))
             X_sample = X.head(sample_size)
             y_sample = y.head(sample_size)
             
@@ -365,7 +365,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             
             warmup_count = 0
             # Iterate over the dataset
-            for xi, yi in stream.iter_pandas(X_sample, y_sample, shuffle=True, seed=1):
+            for xi, yi in stream.iter_pandas(X, y, shuffle=True, seed=1):
                 # Convert to float to ensure compatibility
                 xi_clean = {k: float(v) for k, v in xi.items()}
                 
@@ -417,7 +417,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             self.logger.debug(f"DDoS probability: {ddos_prob:.3f}, Normal probability: {normal_prob:.3f}")
             
             # Detect DDoS if probability > threshold
-            if ddos_prob > 0.6:  # Lowered threshold for simulation
+            if ddos_prob > 0.7:  # Lowered threshold for simulation
                 self.logger.warning(f"DDoS attack detected! DDoS probability: {ddos_prob:.3f}")
                 # Online learning - update model with detected attack
                 self.ai_model.learn_one(clean_features, 0)  # 0 = DDoS
@@ -425,6 +425,7 @@ class SimpleSwitch13(app_manager.RyuApp):
             else:
                 # Learn from normal traffic
                 self.ai_model.learn_one(clean_features, 1)  # 1 = Normal
+                self.logger.warning(f"-----------------------Probability: {normal_prob:.3f}")
                 return False
                 
         except Exception as e:
@@ -650,9 +651,11 @@ class SimpleSwitch13(app_manager.RyuApp):
                self.mac_to_port[dpid][src] = in_port
 
             # --- Create granular match for installing flow rules ---
-            # Start with a default L2 match, and add more details if available
             match_fields = {'in_port': in_port, 'eth_src': src, 'eth_dst': dst}
 
+            ip_pkt = None
+            tcp_pkt_proto = None
+            udp_pkt_proto = None
             if eth.ethertype == ether_types.ETH_TYPE_IP:
                 match_fields['eth_type'] = eth.ethertype
                 ip_pkt = pkt.get_protocol(ipv4.ipv4)
@@ -678,7 +681,6 @@ class SimpleSwitch13(app_manager.RyuApp):
                             match_fields['udp_dst'] = udp_pkt_proto.dst_port
                 else:
                     self.logger.debug(f"DPID {dpid}: eth_type IP but no ipv4_protocol found in packet")
-            
             elif eth.ethertype == ether_types.ETH_TYPE_ARP:
                 match_fields['eth_type'] = eth.ethertype
                 arp_pkt_proto = pkt.get_protocol(arp.arp)
